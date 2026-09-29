@@ -18,11 +18,11 @@ use std::time::{Duration, SystemTime};
 // how often we poll for keyboard input / redraw. 16ms ≈ 60Hz.
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(16);
 
-/// how far the noise time axis advances per frame; lower = slower drift.
+/// how far the noise time axis advances per frame; lower = slower drift
 const NOISE_TIME_STEP: f64 = 0.003;
 /// perlin output rarely gets near ±1, so stretch it before using it as a modulator
 const NOISE_GAIN: f32 = 2.5;
-/// how much perlin noise modulates the base amplitude over time (±50% of base).
+/// how much perlin noise modulates the base amplitude over time (±50% of base)
 const AMPLITUDE_VARIATION: f32 = 0.5;
 
 /// how quickly the amplitude envelope changes along x. 0.02 => a new "hill" every ~50 columns
@@ -31,14 +31,49 @@ const ENVELOPE_SCALE: f32 = 0.02;
 const ENVELOPE_VARIATION: f32 = 0.7;
 
 /// hard cap on rendered thickness so a bad config can't turn the wave into a
-/// wall of characters or waste time drawing off screen rows.
+/// wall of characters or waste time drawing off screen rows
 const MAX_THICKNESS: u16 = 20;
-/// smallest wavelength we'll accept => anything <= 0 would divide-by-zero.
+/// smallest wavelength we'll accept => anything <= 0 would divide-by-zero
 const MIN_WAVELENGTH: f32 = 1.0;
+/// upper bound on the smoothing kernel radius (in columns)
+const MAX_SMOOTHING: usize = 16;
 
 const HIGH_INTENSITY_THRESHOLD: f32 = 0.9;
 const MED_INTENSITY_THRESHOLD: f32 = 0.5;
 //const LOW_INTENSITY_THRESHOLD: f32 = 0.3; don't need it tbh
+
+/// soft saturating replacement for clamp -1 1
+fn soft_limit(v: f32) -> f32 {
+    v.tanh()
+}
+
+/// gaussian-weighted moving average; edges renormalize instead of padding
+fn smooth(values: &[f32], radius: usize) -> Vec<f32> {
+    if radius == 0 || values.len() < 2 {
+        return values.to_vec();
+    }
+    let r = radius as i32;
+    let sigma = (radius as f32 / 2.0).max(0.5);
+    let weights: Vec<f32> = (-r..=r)
+        .map(|k| (-(k as f32).powi(2) / (2.0 * sigma * sigma)).exp())
+        .collect();
+
+    let n = values.len() as i32;
+    (0..n)
+        .map(|i| {
+            let (mut acc, mut wsum) = (0.0f32, 0.0f32);
+            for (k, w) in (-r..=r).zip(&weights) {
+                let j = i + k;
+                if j < 0 || j >= n {
+                    continue;
+                }
+                acc += values[j as usize] * w;
+                wsum += w;
+            }
+            acc / wsum
+        })
+        .collect()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)] // missing fields in config.json fall back to default instead of failing the whole parse
@@ -47,6 +82,9 @@ struct Sinewave {
     amplitude: f32,
     speed: f32,
     thickness: u16,
+
+    /// gaussian smoothing radius in columns; 0 = off
+    smoothing: usize,
 
     theme: Theme,
 
@@ -67,6 +105,7 @@ impl Default for Sinewave {
             time: 0.0,
             noise_t: 0.0,
             thickness: 0,
+            smoothing: 4,
             theme: Theme {
                 high_intensity: [0, 0, 0],
                 med_intensity: [0, 0, 0],
@@ -92,12 +131,13 @@ impl Sinewave {
             self.amplitude = 0.0;
         }
         self.thickness = self.thickness.min(MAX_THICKNESS);
+        self.smoothing = self.smoothing.min(MAX_SMOOTHING);
     }
 
     /// wavelength/amplitude from the config are base values; perlin noise
     /// modulates them smoothly over time. computed once per frame.
     fn current_params(&self, p: &Perlin) -> (f32, f32) {
-        let amp_n = (p.get([self.noise_t, 200.5]) as f32 * NOISE_GAIN).clamp(-1.0, 1.0);
+        let amp_n = soft_limit(p.get([self.noise_t, 200.5]) as f32 * NOISE_GAIN);
         let amplitude = self.amplitude * (1.0 + AMPLITUDE_VARIATION * amp_n);
         (self.wavelength, amplitude)
     }
@@ -107,7 +147,7 @@ impl Sinewave {
     /// taller than others and the pattern slowly evolves over time
     fn amplitude_at(&self, x: f32, amplitude: f32, p: &Perlin) -> f32 {
         let n = p.get([(x * ENVELOPE_SCALE) as f64, self.noise_t + 300.5]) as f32;
-        let n = (n * NOISE_GAIN).clamp(-1.0, 1.0);
+        let n = soft_limit(n * NOISE_GAIN);
         amplitude * (1.0 + ENVELOPE_VARIATION * n)
     }
 
@@ -122,9 +162,7 @@ impl Sinewave {
 
         let noise_distortion = p.get(noise_sample_point) as f32;
 
-        let final_y_offset = base_sine + (noise_distortion * 15.0);
-
-        final_y_offset
+        base_sine + (noise_distortion * 15.0)
     }
 }
 
@@ -204,73 +242,59 @@ impl<'a> Widget for WaveWidget<'a> {
             return;
         }
 
-        let middle_y = area.y + (area.height / 2);
-
+        let middle_y = area.y as i32 + (area.height / 2) as i32;
         let p = self.perlin;
 
         // noise-modulated wavelength/amplitude, computed once per frame
         let (wavelength, amplitude) = self.wave.current_params(p);
 
+        // raw per-column offsets and local amplitudes
+        let mut amps = Vec::with_capacity(area.width as usize);
+        let mut offsets = Vec::with_capacity(area.width as usize);
         for x_cell in area.x..area.right() {
-            let relative_x = (x_cell - area.x) as f32;
+            let rel_x = (x_cell - area.x) as f32;
             // amplitude varies along x so some stretches are taller than others
-            let local_amplitude = self.wave.amplitude_at(relative_x, amplitude, p);
-            let y_offset = self
-                .wave
-                .get_y_offset(relative_x, wavelength, local_amplitude, p);
-            let target_y = (middle_y as f32 - y_offset.round()) as i32;
+            let local_amp = self.wave.amplitude_at(rel_x, amplitude, p);
+            amps.push(local_amp);
+            offsets.push(self.wave.get_y_offset(rel_x, wavelength, local_amp, p));
+        }
 
-            if target_y < area.y as i32 || target_y >= area.bottom() as i32 {
-                continue;
-            }
+        // smooth across x
+        let offsets = smooth(&offsets, self.wave.smoothing);
 
-            let cell_idx_y = target_y as u16;
-            let signal_intensity = if local_amplitude.abs() < f32::EPSILON {
+        let mut prev_y: Option<i32> = None;
+        let t = self.wave.thickness as i32;
+        for (i, x_cell) in (area.x..area.right()).enumerate() {
+            let y_offset = offsets[i];
+            let local_amp = amps[i];
+            let target_y = middle_y - y_offset.round() as i32;
+
+            let signal_intensity = if local_amp.abs() < f32::EPSILON {
                 0.0
             } else {
-                (y_offset.abs() / local_amplitude.abs()).clamp(0.0, 1.0)
+                (y_offset / local_amp.abs()).clamp(0.0, 1.0)
             };
 
-            let wave_color = if signal_intensity > HIGH_INTENSITY_THRESHOLD {
-                self.wave.theme.high()
+            let (wave_color, symbol) = if signal_intensity > HIGH_INTENSITY_THRESHOLD {
+                (self.wave.theme.high(), "#")
             } else if signal_intensity > MED_INTENSITY_THRESHOLD {
-                self.wave.theme.med()
+                (self.wave.theme.med(), "+")
             } else {
-                self.wave.theme.low()
-            };
-
-            let symbol = if signal_intensity > HIGH_INTENSITY_THRESHOLD {
-                "#"
-            } else if signal_intensity > MED_INTENSITY_THRESHOLD {
-                "+"
-            } else {
-                ":"
+                (self.wave.theme.low(), ":")
             };
 
             let style = Style::default().fg(wave_color).add_modifier(Modifier::BOLD);
 
-            if let Some(cell) = buf.cell_mut(Position::new(x_cell, cell_idx_y)) {
-                cell.set_symbol(symbol);
-                cell.set_style(style);
-            }
+            // span covers the jump from the previous column, plus thickness
+            let from = prev_y.unwrap_or(target_y);
+            let lo = (from.min(target_y) - t).max(area.y as i32);
+            let hi = (from.max(target_y) + t).min(area.bottom() as i32 - 1);
+            prev_y = Some(target_y);
 
-            // thicken the line by painting `thickness` extra cells above and
-            // below the sample point, staying inside the widget's area
-            for i in 1..=self.wave.thickness {
-                let upper_y = cell_idx_y.saturating_sub(i);
-                if upper_y >= area.y && upper_y != cell_idx_y {
-                    if let Some(cell) = buf.cell_mut(Position::new(x_cell, upper_y)) {
-                        cell.set_symbol(symbol);
-                        cell.set_style(style);
-                    }
-                }
-
-                let lower_y = cell_idx_y.saturating_add(i);
-                if lower_y < area.bottom() {
-                    if let Some(cell) = buf.cell_mut(Position::new(x_cell, lower_y)) {
-                        cell.set_symbol(symbol);
-                        cell.set_style(style);
-                    }
+            for y in lo..=hi {
+                if let Some(cell) = buf.cell_mut(Position::new(x_cell, y as u16)) {
+                    cell.set_symbol(symbol);
+                    cell.set_style(style);
                 }
             }
         }
@@ -323,7 +347,12 @@ impl App {
     pub fn new(args: Args) -> Self {
         Self {
             sinewave: Sinewave::default(),
-            perlin: Perlin::new(1337),
+            perlin: Perlin::new(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs() as u32,
+            ),
             exit: false,
             config_watcher: ConfigWatcher::new(config_path()),
             config_error: None,
@@ -378,8 +407,8 @@ impl App {
                     // show the live, noise-modulated values rather than the base config
                     let (wavelength, amplitude) = self.sinewave.current_params(&self.perlin);
                     format!(
-                        " wavelength: {:.2} | amplitude: {:.1} | thickness: {} | press 'q' to exit",
-                        wavelength, amplitude, self.sinewave.thickness
+                        " wavelength: {:.2} | amplitude: {:.1} | thickness: {} | smoothing: {} | press 'q' to exit",
+                        wavelength, amplitude, self.sinewave.thickness, self.sinewave.smoothing
                     )
                 }
             };
